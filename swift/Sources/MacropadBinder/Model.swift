@@ -152,6 +152,17 @@ struct PadProfile: Codable, Hashable {
     static var blank: PadProfile {
         PadProfile(layers: [.blank, .blank, .blank])
     }
+
+    var isBlank: Bool {
+        layers.allSatisfy { layer in
+            ControlID.allCases.allSatisfy { layer[$0].isEmpty }
+        }
+    }
+}
+
+struct CachedPadSnapshot: Codable {
+    var profile: PadProfile
+    var savedAt: Date
 }
 
 struct BindingDiff: Identifiable {

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "command": ".cursor/hooks/strip-cursor-coauthor.py",
+        "matcher": "Shell"
+      }
+    ]
+  }
+}

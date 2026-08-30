@@ -24,15 +24,16 @@ struct MacropadBinderApp: App {
             CommandMenu("Pad") {
                 Button("Read from pad") { Task { await store.readFromDevice() } }
                     .keyboardShortcut("r", modifiers: .command)
+                    .disabled(!store.programmable)
                 Button("Write to pad") { store.requestWrite() }
                     .keyboardShortcut("s", modifiers: .command)
-                    .disabled(store.mode != .write || !store.dirty)
+                    .disabled(!store.programmable || store.mode != .write || !store.dirty)
                 Button("Revert unsaved") { store.revert() }
-                    .disabled(store.mode != .write || !store.dirty)
+                    .disabled(!store.programmable || store.mode != .write || !store.dirty)
                 Divider()
                 Button("Capture shortcut") { store.beginCapture() }
                     .keyboardShortcut("k", modifiers: .command)
-                    .disabled(store.mode != .write)
+                    .disabled(!store.programmable || store.mode != .write)
             }
         }
     }

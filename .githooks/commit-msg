@@ -1,0 +1,20 @@
+#!/bin/sh
+# Stella C is the only author. Drop Cursor co-author trailers.
+msg_file="$1"
+[ -n "$msg_file" ] && [ -f "$msg_file" ] || exit 0
+
+tmp="${msg_file}.strip"
+# shellcheck disable=SC2016
+sed -E \
+  -e '/^[[:space:]]*Co-authored-by:[[:space:]]*Cursor( Agent)?[[:space:]]*<cursoragent@cursor\.com>[[:space:]]*$/Id' \
+  -e '/^[[:space:]]*Co-authored-by:[[:space:]]*.*<[^>]*@cursor\.com>[[:space:]]*$/Id' \
+  "$msg_file" > "$tmp" || exit 0
+
+# Trim trailing blank lines
+while [ -s "$tmp" ] && [ "$(tail -n 1 "$tmp")" = "" ]; do
+  # macOS sed: delete last line if empty
+  sed -i '' -e '${/^$/d;}' "$tmp" 2>/dev/null || break
+done
+
+mv "$tmp" "$msg_file"
+exit 0

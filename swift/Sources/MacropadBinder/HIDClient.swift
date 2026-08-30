@@ -19,12 +19,24 @@ enum HIDError: LocalizedError {
     }
 }
 
+enum PadLink {
+    case none
+    case usb
+    case bluetooth
+}
+
 final class HIDClient {
     static let vendorID = 0x1189
     static let productID = 0x8840
+    /// BLE HID identity (Apple-spoofed). USB programming uses vendorID/productID.
+    static let bluetoothVendorID = 0x05AC
+    static let bluetoothProductID = 0x022C
+    static let bluetoothProduct = "MINI_KEYBOARD"
 
     private var incoming: [Data] = []
     private var reportBuf = [UInt8](repeating: 0, count: 65)
+    private var batteryCache: (at: Date, value: Int?) = (.distantPast, nil)
+    private var batteryRefreshing = false
 
     private func matchingVendor() -> [String: Any] {
         [
@@ -35,14 +47,124 @@ final class HIDClient {
         ]
     }
 
-    func isPresent() -> Bool {
-        if isSniffing { return true }
+    private func matchingAnyInterface() -> [String: Any] {
+        [
+            kIOHIDVendorIDKey as String: Self.vendorID,
+            kIOHIDProductIDKey as String: Self.productID,
+        ]
+    }
+
+    private func matchingBluetoothPad() -> [String: Any] {
+        [kIOHIDProductKey as String: Self.bluetoothProduct]
+    }
+
+    private func devices(matching: [String: Any]) -> [IOHIDDevice] {
+        devices(matchingAny: [matching])
+    }
+
+    private func devices(matchingAny dicts: [[String: Any]]) -> [IOHIDDevice] {
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        IOHIDManagerSetDeviceMatching(manager, matchingVendor() as CFDictionary)
+        IOHIDManagerSetDeviceMatchingMultiple(manager, dicts as CFArray)
         IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-        let found = (IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>)?.isEmpty == false
-        IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-        return found
+        defer { IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone)) }
+        return Array((IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>) ?? [])
+    }
+
+    private func padMatchers() -> [[String: Any]] {
+        [
+            matchingAnyInterface(),
+            matchingBluetoothPad(),
+            [
+                kIOHIDVendorIDKey as String: NSNumber(value: Self.bluetoothVendorID),
+                kIOHIDProductIDKey as String: NSNumber(value: Self.bluetoothProductID),
+                kIOHIDProductKey as String: Self.bluetoothProduct,
+            ],
+        ]
+    }
+
+    private func transport(of device: IOHIDDevice) -> String {
+        ((IOHIDDeviceGetProperty(device, kIOHIDTransportKey as CFString) as? String) ?? "").lowercased()
+    }
+
+    private func intProp(_ device: IOHIDDevice, _ key: String) -> Int {
+        (IOHIDDeviceGetProperty(device, key as CFString) as? NSNumber)?.intValue ?? 0
+    }
+
+    private func stringProp(_ device: IOHIDDevice, _ key: String) -> String {
+        (IOHIDDeviceGetProperty(device, key as CFString) as? String) ?? ""
+    }
+
+    /// USB vendor pad (1189:8840) or the BLE clone named MINI_KEYBOARD.
+    /// Matching dicts can accidentally bind every HID device — always filter here.
+    func isPadDevice(_ device: IOHIDDevice) -> Bool {
+        let product = stringProp(device, kIOHIDProductKey)
+        if product.caseInsensitiveCompare(Self.bluetoothProduct) == .orderedSame { return true }
+        let vid = intProp(device, kIOHIDVendorIDKey)
+        let pid = intProp(device, kIOHIDProductIDKey)
+        return vid == Self.vendorID && pid == Self.productID
+    }
+
+    /// Vendor programming interface — USB only on this firmware.
+    func isProgrammable() -> Bool {
+        !devices(matching: matchingVendor()).isEmpty
+    }
+
+    func isPresent() -> Bool {
+        if !sniffDevices.isEmpty { return true }
+        return devices(matchingAny: padMatchers()).contains(where: isPadDevice)
+    }
+
+    func currentLink() -> PadLink {
+        if isProgrammable() { return .usb }
+        let found = devices(matchingAny: padMatchers()).filter(isPadDevice)
+        if found.contains(where: { transport(of: $0).contains("bluetooth") }) { return .bluetooth }
+        if !found.isEmpty || !sniffDevices.isEmpty { return .bluetooth }
+        return .none
+    }
+
+    /// Cached BLE battery from system_profiler. Nil on USB or if unknown.
+    func bluetoothBatteryPercent() -> Int? {
+        if Date().timeIntervalSince(batteryCache.at) < 20 {
+            return batteryCache.value
+        }
+        if !batteryRefreshing {
+            batteryRefreshing = true
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let value = Self.readProfilerBattery()
+                DispatchQueue.main.async {
+                    self?.batteryCache = (Date(), value)
+                    self?.batteryRefreshing = false
+                }
+            }
+        }
+        return batteryCache.value
+    }
+
+    private static func readProfilerBattery() -> Int? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
+        proc.arguments = ["SPBluetoothDataType", "-json"]
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = Pipe()
+        do { try proc.run() } catch { return nil }
+        proc.waitUntilExit()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        guard
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let root = (json["SPBluetoothDataType"] as? [[String: Any]])?.first,
+            let connected = root["device_connected"] as? [[String: Any]]
+        else { return nil }
+        for wrapper in connected {
+            for (name, raw) in wrapper {
+                guard name.caseInsensitiveCompare(bluetoothProduct) == .orderedSame else { continue }
+                guard let info = raw as? [String: Any] else { continue }
+                let text = (info["device_batteryLevelMain"] as? String) ?? ""
+                let digits = text.prefix(while: { $0.isNumber })
+                return Int(digits)
+            }
+        }
+        return nil
     }
 
     var isSniffing: Bool { sniffManager != nil && !sniffDevices.isEmpty }
@@ -160,92 +282,124 @@ final class HIDClient {
 
     private var sniffManager: IOHIDManager?
     private var sniffDevices: [IOHIDDevice] = []
-    private var sniffBuf = [UInt8](repeating: 0, count: 32)
     private var sniffHandler: ((PadEvent) -> Void)?
+    private var sniffPhysical: ((ControlID) -> Void)?
+    private var sniffMods: UInt8 = 0
+    private var lastChord: (PadEvent, Date)?
+    private var lastPhysical: (ControlID, Date)?
 
-    func startSniff(_ handler: @escaping (PadEvent) -> Void) {
-        if isSniffing {
-            sniffHandler = handler
-            return
-        }
+    func startSniff(_ handler: @escaping (PadEvent) -> Void, physical: ((ControlID) -> Void)? = nil) {
+        sniffHandler = handler
+        sniffPhysical = physical
+        if isSniffing { return }
         stopSniff()
         sniffHandler = handler
+        sniffPhysical = physical
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        let matching: [String: Any] = [
-            kIOHIDVendorIDKey as String: Self.vendorID,
-            kIOHIDProductIDKey as String: Self.productID,
-            kIOHIDPrimaryUsagePageKey as String: 1,
-            kIOHIDPrimaryUsageKey as String: 6,
-        ]
-        IOHIDManagerSetDeviceMatching(manager, matching as CFDictionary)
+        IOHIDManagerSetDeviceMatchingMultiple(manager, padMatchers() as CFArray)
+        IOHIDManagerRegisterInputValueCallback(manager, { context, _, _, value in
+            guard let context else { return }
+            Unmanaged<HIDClient>.fromOpaque(context).takeUnretainedValue().handleValue(value)
+        }, Unmanaged.passUnretained(self).toOpaque())
         IOHIDManagerRegisterDeviceMatchingCallback(manager, { context, _, _, device in
             guard let context else { return }
-            let client = Unmanaged<HIDClient>.fromOpaque(context).takeUnretainedValue()
-            client.attachSniffDevice(device)
+            Unmanaged<HIDClient>.fromOpaque(context).takeUnretainedValue().attachSniffDevice(device)
+        }, Unmanaged.passUnretained(self).toOpaque())
+        IOHIDManagerRegisterDeviceRemovalCallback(manager, { context, _, _, device in
+            guard let context else { return }
+            Unmanaged<HIDClient>.fromOpaque(context).takeUnretainedValue().detachSniffDevice(device)
         }, Unmanaged.passUnretained(self).toOpaque())
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
         sniffManager = manager
 
-        let devices = (IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>) ?? []
-        for device in devices {
+        let found = (IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>) ?? []
+        for device in found {
             attachSniffDevice(device)
         }
     }
 
     private func attachSniffDevice(_ device: IOHIDDevice) {
+        guard isPadDevice(device) else { return }
         if sniffDevices.contains(where: { $0 === device }) { return }
-        let rc = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
-        guard rc == kIOReturnSuccess else { return }
-        IOHIDDeviceRegisterInputReportCallback(device, &sniffBuf, sniffBuf.count, { context, _, _, _, reportID, report, length in
-            guard let context else { return }
-            let client = Unmanaged<HIDClient>.fromOpaque(context).takeUnretainedValue()
-            let data = Data(bytes: report, count: length)
-            if let event = client.parseInput(reportID: reportID, data: data) {
-                let handler = client.sniffHandler
-                DispatchQueue.main.async { handler?(event) }
-            }
-        }, Unmanaged.passUnretained(self).toOpaque())
-        IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        _ = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
         sniffDevices.append(device)
     }
 
+    private func detachSniffDevice(_ device: IOHIDDevice) {
+        guard let idx = sniffDevices.firstIndex(where: { $0 === device }) else { return }
+        IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
+        sniffDevices.remove(at: idx)
+    }
+
     func stopSniff() {
-        for device in sniffDevices {
-            IOHIDDeviceRegisterInputReportCallback(device, &sniffBuf, sniffBuf.count, nil, nil)
-            IOHIDDeviceUnscheduleFromRunLoop(device, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-            IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
-        }
-        sniffDevices.removeAll()
         if let sniffManager {
+            IOHIDManagerRegisterInputValueCallback(sniffManager, nil, nil)
+            IOHIDManagerRegisterDeviceMatchingCallback(sniffManager, nil, nil)
+            IOHIDManagerRegisterDeviceRemovalCallback(sniffManager, nil, nil)
             IOHIDManagerUnscheduleFromRunLoop(sniffManager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
             IOHIDManagerClose(sniffManager, IOOptionBits(kIOHIDOptionsTypeNone))
         }
+        for device in sniffDevices {
+            IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
+        }
+        sniffDevices.removeAll()
         sniffManager = nil
         sniffHandler = nil
+        sniffPhysical = nil
+        sniffMods = 0
     }
 
-    fileprivate func parseInput(reportID: UInt32, data: Data) -> PadEvent? {
-        var bytes = [UInt8](data)
-        var id = UInt8(truncatingIfNeeded: reportID)
-        if bytes.first == id, id != 0 {
-            bytes.removeFirst()
-        } else if reportID == 0, let first = bytes.first, [1, 2, 4, 5].contains(first) {
-            id = first
-            bytes.removeFirst()
-        }
-        switch id {
-        case 1, 4:
-            guard bytes.count >= 3 else { return nil }
-            let mods = bytes[0]
-            guard let code = bytes.dropFirst(2).first(where: { $0 != 0 }) else { return nil }
-            return .key(mods: mods, code: code)
-        case 5:
-            guard bytes.count >= 2 else { return nil }
-            let usage = UInt16(bytes[0]) | (UInt16(bytes[1]) << 8)
-            return usage == 0 ? nil : .media(usage)
+    private func handleValue(_ value: IOHIDValue) {
+        let element = IOHIDValueGetElement(value)
+        let device = IOHIDElementGetDevice(element)
+        guard isPadDevice(device) else { return }
+
+        let page = IOHIDElementGetUsagePage(element)
+        let usage = IOHIDElementGetUsage(element)
+        let pressed = IOHIDValueGetIntegerValue(value)
+
+        switch page {
+        case 0x07:
+            if usage >= 0xE0 && usage <= 0xE7 {
+                let bit = UInt8(1 << (usage - 0xE0))
+                if pressed != 0 { sniffMods |= bit } else { sniffMods &= ~bit }
+                return
+            }
+            guard pressed != 0, usage >= 0x04, usage <= 0xA4 else { return }
+            emitChord(.key(mods: sniffMods, code: UInt8(truncatingIfNeeded: usage)))
+        case 0x0C:
+            guard pressed != 0, usage != 0 else { return }
+            emitChord(.media(UInt16(truncatingIfNeeded: usage)))
+        case 0x09:
+            guard pressed != 0 else { return }
+            switch usage {
+            case 1: emitPhysical(.key1)
+            case 2: emitPhysical(.key2)
+            case 3: emitPhysical(.key3)
+            default: break
+            }
+        case 0x01:
+            if usage == 0x38 {
+                if pressed > 0 { emitPhysical(.knobCW) }
+                else if pressed < 0 { emitPhysical(.knobCCW) }
+            }
         default:
-            return nil
+            break
         }
+    }
+
+    private func emitChord(_ event: PadEvent) {
+        if let last = lastChord, last.0 == event, Date().timeIntervalSince(last.1) < 0.04 { return }
+        lastChord = (event, Date())
+        let handler = sniffHandler
+        DispatchQueue.main.async { handler?(event) }
+    }
+
+    private func emitPhysical(_ control: ControlID) {
+        if let last = lastPhysical, last.0 == control, Date().timeIntervalSince(last.1) < 0.05 { return }
+        lastPhysical = (control, Date())
+        let handler = sniffPhysical
+        DispatchQueue.main.async { handler?(control) }
     }
 }

@@ -9,8 +9,10 @@ enum BinderMode: String {
 @MainActor
 final class PadStore: ObservableObject {
     @Published var connected = false
+    @Published var programmable = false
+    @Published var link: PadLink = .none
     @Published var busy = false
-    @Published var status = "Plug in the pad over USB."
+    @Published var status = "Plug in the pad over USB or pair it over Bluetooth."
     @Published var errorMessage: String?
     @Published var layer = 0
     @Published var selected: ControlID = .key1
@@ -19,17 +21,32 @@ final class PadStore: ObservableObject {
     @Published var profile = PadProfile.blank
     @Published var deviceProfile = PadProfile.blank
     @Published var confirmWrite = false
+    @Published var batteryPercent: Int?
     @Published var liveHit: ControlID?
     /// Inferred from the last pad HID report. Nil until a unique match.
     @Published var liveLayer: Int?
+    /// When the cached USB dump was last written. Nil if never saved.
+    @Published var cacheSavedAt: Date?
 
     private let hid = HIDClient()
     private var pollTask: Task<Void, Never>?
     private var captureMonitor: Any?
     private var padEventMonitor: Any?
+    private var padGlobalMonitor: Any?
     private var presenceMisses = 0
+    private var lastPadHeard: Date?
 
     var dirty: Bool { profile != deviceProfile }
+
+    /// Bluetooth cannot read firmware; the shown map is the last USB dump.
+    var showingHistory: Bool { link == .bluetooth && !profile.isBlank }
+
+    var historyCaption: String {
+        if let at = cacheSavedAt {
+            return "Last USB read \(at.formatted(date: .abbreviated, time: .shortened))"
+        }
+        return "Last USB read — time unknown"
+    }
 
     var selectedBinding: PadBinding {
         get { profile.layers[layer][selected] }
@@ -52,6 +69,7 @@ final class PadStore: ObservableObject {
 
     func start() {
         guard pollTask == nil else { return }
+        loadCachedProfile()
         startPadEventMonitor()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -70,31 +88,61 @@ final class PadStore: ObservableObject {
             NSEvent.removeMonitor(monitor)
             padEventMonitor = nil
         }
+        if let monitor = padGlobalMonitor {
+            NSEvent.removeMonitor(monitor)
+            padGlobalMonitor = nil
+        }
     }
 
     func refreshPresence() async {
-        let present = hid.isPresent()
+        let usb = hid.isProgrammable()
+        let hidSeen = hid.isPresent()
+        let heard = lastPadHeard.map { Date().timeIntervalSince($0) < 90 } ?? false
+        let present = usb || hidSeen || heard
+        let previous = link
+        programmable = usb
+        let next: PadLink = usb ? .usb : (present ? .bluetooth : .none)
+
         if present {
             presenceMisses = 0
-            if !connected {
-                connected = true
-                status = "Pad connected."
-                await readFromDevice()
-            } else if !hid.isSniffing, !busy {
-                startSniff()
+            let becamePresent = !connected
+            let linkChanged = previous != next
+            connected = true
+            link = next
+            if usb {
+                if becamePresent || (linkChanged && previous != .usb) {
+                    status = "Pad connected over USB."
+                    await readFromDevice()
+                } else if !hid.isSniffing, !busy {
+                    startSniff()
+                }
+            } else {
+                enterBluetoothInspect(announce: becamePresent || linkChanged, restart: linkChanged)
             }
         } else {
             presenceMisses += 1
             if connected && presenceMisses >= 3 {
                 connected = false
+                programmable = false
+                link = .none
+                batteryPercent = nil
                 hid.stopSniff()
                 liveLayer = nil
                 status = "Pad disconnected."
             }
         }
+        if present, link == .bluetooth {
+            batteryPercent = hid.bluetoothBatteryPercent()
+        } else if link == .usb {
+            batteryPercent = nil
+        }
     }
 
     func readFromDevice() async {
+        guard hid.isProgrammable() else {
+            status = "Read/flash needs USB. Bluetooth is input-only."
+            return
+        }
         guard !busy else { return }
         busy = true
         errorMessage = nil
@@ -106,6 +154,7 @@ final class PadStore: ObservableObject {
             let loaded = try hid.readAll()
             profile = loaded
             deviceProfile = loaded
+            saveCachedProfile()
             startSniff()
             mode = .read
             endCapture()
@@ -117,16 +166,24 @@ final class PadStore: ObservableObject {
     }
 
     func setMode(_ next: BinderMode) {
+        if next == .write, !programmable {
+            status = "Write needs USB. Bluetooth is inspect-only (history map)."
+            return
+        }
         mode = next
         if next == .read {
             endCapture()
-            status = "Read mode. Press a pad key to inspect."
+            status = link == .bluetooth ? bluetoothStatus : "Read mode. Press a pad key to inspect."
         } else {
             status = "Write mode. Capture or pick a preset, then flash the pad."
         }
     }
 
     func requestWrite() {
+        guard hid.isProgrammable() else {
+            status = "Read/flash needs USB. Bluetooth is input-only."
+            return
+        }
         guard mode == .write else { return }
         guard dirty else {
             status = "Nothing to write."
@@ -150,6 +207,7 @@ final class PadStore: ObservableObject {
             let loaded = try hid.readAll()
             profile = loaded
             deviceProfile = loaded
+            saveCachedProfile()
             startSniff()
             mode = .read
             endCapture()
@@ -166,12 +224,12 @@ final class PadStore: ObservableObject {
     }
 
     func apply(_ binding: PadBinding) {
-        guard mode == .write else { return }
+        guard programmable, mode == .write else { return }
         profile.layers[layer][selected] = binding
     }
 
     func applyPreset(_ preset: PadPreset) {
-        guard mode == .write else { return }
+        guard programmable, mode == .write else { return }
         if preset.layers.count >= 3 {
             profile.layers = Array(preset.layers.prefix(3))
             status = "Applied \(preset.title) to L1–L3. Write to flash the pad."
@@ -186,7 +244,7 @@ final class PadStore: ObservableObject {
     }
 
     func beginCapture() {
-        guard mode == .write else { return }
+        guard programmable, mode == .write else { return }
         capturing = true
         status = "Press a shortcut on the MacBook keyboard…"
         captureMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -221,8 +279,57 @@ final class PadStore: ObservableObject {
 
     private func startSniff() {
         hid.startSniff { [weak self] event in
-            Task { @MainActor in self?.inferLiveLayer(from: event) }
+            Task { @MainActor in self?.notePadInput(event) }
+        } physical: { [weak self] control in
+            Task { @MainActor in self?.notePhysicalHit(control) }
         }
+    }
+
+    private func notePhysicalHit(_ control: ControlID) {
+        lastPadHeard = Date()
+        if !connected {
+            connected = true
+            programmable = hid.isProgrammable()
+            link = programmable ? .usb : .bluetooth
+        }
+        selected = control
+        flash(control)
+        let history = link == .bluetooth ? " · history" : ""
+        status = "Pad \(control.title)\(history)"
+    }
+
+    private func enterBluetoothInspect(announce: Bool, restart: Bool) {
+        if mode == .write {
+            mode = .read
+            endCapture()
+        }
+        if restart {
+            hid.stopSniff()
+            startSniff()
+        } else if !hid.isSniffing, !busy {
+            startSniff()
+        }
+        if announce {
+            status = bluetoothStatus
+        }
+    }
+
+    private var bluetoothStatus: String {
+        if profile.isBlank {
+            return "Bluetooth · inspect only. No saved map — plug USB once to load bindings."
+        }
+        return "Bluetooth · \(historyCaption). Capture and write disabled."
+    }
+
+    /// HID reports fire even when the window is not key. Always count as a pad press.
+    private func notePadInput(_ event: PadEvent) {
+        lastPadHeard = Date()
+        if !connected {
+            connected = true
+            programmable = hid.isProgrammable()
+            link = programmable ? .usb : .bluetooth
+        }
+        inferLiveLayer(from: event)
     }
 
     /// Backup path: pad keystrokes land as normal NSEvents while this window is key.
@@ -238,10 +345,15 @@ final class PadStore: ObservableObject {
                 if !self.capturing {
                     Task { @MainActor in self.inferLiveLayer(from: padEvent) }
                 }
-                // Eat pad chords so ⌘K / ⌘S on the pad cannot enter write/capture.
                 return nil
             }
             return event
+        }
+        padGlobalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, let chord = MacKey.hid(from: event) else { return }
+            let padEvent = PadEvent.key(mods: chord.mods, code: chord.code)
+            guard self.matchesPadBinding(padEvent) else { return }
+            Task { @MainActor in self.inferLiveLayer(from: padEvent) }
         }
     }
 
@@ -269,7 +381,20 @@ final class PadStore: ObservableObject {
                 }
             }
         }
-        guard !hits.isEmpty else { return }
+        lastPadHeard = Date()
+        if !connected {
+            connected = true
+            programmable = hid.isProgrammable()
+            link = programmable ? .usb : .bluetooth
+        }
+        guard !hits.isEmpty else {
+            if link == .bluetooth {
+                status = profile.isBlank
+                    ? "Heard \(label(for: event)) from pad. Plug USB once to map it to a key."
+                    : "Heard \(label(for: event)) — not in the saved map"
+            }
+            return
+        }
 
         let layers = Set(hits.map(\.0))
         let controls = Set(hits.map(\.1))
@@ -293,11 +418,20 @@ final class PadStore: ObservableObject {
         selected = control
         flash(control)
 
+        let history = link == .bluetooth ? " · history" : ""
         if layers.count == 1 {
-            status = "Pad is on L\(layer + 1) · \(control.title)"
+            status = "Pad is on L\(layer + 1) · \(control.title)\(history)"
         } else {
             let names = layers.sorted().map { "L\($0 + 1)" }.joined(separator: "/")
-            status = "\(control.title) — \(names) share this binding"
+            status = "\(control.title) — \(names) share this binding\(history)"
+        }
+    }
+
+    private func label(for event: PadEvent) -> String {
+        switch event {
+        case .key(let mods, let code): return HIDNames.chord(mods, code)
+        case .media(let usage): return HIDNames.media(usage)
+        case .mouse(let action): return action.label
         }
     }
 
@@ -307,5 +441,38 @@ final class PadStore: ObservableObject {
             try? await Task.sleep(nanoseconds: 180_000_000)
             if liveHit == control { liveHit = nil }
         }
+    }
+
+    private var cacheURL: URL {
+        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MacropadBinder", isDirectory: true)
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root.appendingPathComponent("last-profile.json")
+    }
+
+    private func loadCachedProfile() {
+        guard let data = try? Data(contentsOf: cacheURL) else { return }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        if let snap = try? decoder.decode(CachedPadSnapshot.self, from: data) {
+            profile = snap.profile
+            deviceProfile = snap.profile
+            cacheSavedAt = snap.savedAt
+            return
+        }
+        guard let loaded = try? decoder.decode(PadProfile.self, from: data) else { return }
+        profile = loaded
+        deviceProfile = loaded
+        cacheSavedAt = (try? FileManager.default.attributesOfItem(atPath: cacheURL.path)[.modificationDate] as? Date)
+    }
+
+    private func saveCachedProfile() {
+        cacheSavedAt = Date()
+        let snap = CachedPadSnapshot(profile: deviceProfile, savedAt: cacheSavedAt ?? Date())
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(snap) else { return }
+        try? data.write(to: cacheURL, options: .atomic)
     }
 }

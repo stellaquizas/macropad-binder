@@ -57,9 +57,16 @@ struct ContentView: View {
                 Circle()
                     .fill(store.connected ? Theme.good : Theme.muted)
                     .frame(width: 8, height: 8)
-                Text(store.connected
-                     ? (store.liveLayer.map { "live L\($0 + 1)" } ?? "live ?")
-                     : "offline")
+                Text({
+                    if !store.connected { return "offline" }
+                    var parts = [store.link == .bluetooth ? "bluetooth" : "usb"]
+                    if let pct = store.batteryPercent { parts.append("\(pct)%") }
+                    if store.link == .bluetooth {
+                        parts.append(store.showingHistory ? "history" : "no map")
+                    }
+                    parts.append(store.liveLayer.map { "live L\($0 + 1)" } ?? "live ?")
+                    return parts.joined(separator: " · ")
+                }())
                     .font(.system(size: 12, weight: .medium, design: .monospaced))
                     .foregroundStyle(Theme.muted)
             }
@@ -71,7 +78,7 @@ struct ContentView: View {
             modePicker
 
             Button("Reload") { Task { await store.readFromDevice() } }
-                .disabled(!store.connected || store.busy)
+                .disabled(!store.programmable || store.busy)
             if store.mode == .write {
                 Button("Revert") { store.revert() }
                     .disabled(!store.dirty || store.busy)
@@ -79,7 +86,7 @@ struct ContentView: View {
                     store.requestWrite()
                 }
                 .keyboardShortcut("s", modifiers: .command)
-                .disabled(!store.connected || !store.dirty || store.busy)
+                .disabled(!store.programmable || !store.dirty || store.busy)
                 .buttonStyle(.borderedProminent)
                 .tint(Theme.accent)
             }
@@ -94,6 +101,9 @@ struct ContentView: View {
         HStack(spacing: 0) {
             modeTab(.read, "Read")
             modeTab(.write, "Write")
+                .disabled(!store.programmable)
+                .opacity(store.programmable ? 1 : 0.45)
+                .help(store.programmable ? "Rebind keys" : "Write needs USB")
         }
         .background(Capsule().fill(Theme.raised))
         .clipShape(Capsule())
@@ -143,15 +153,44 @@ struct ContentView: View {
     private var padGrid: some View {
         let layer = store.profile.layers[store.layer]
         let original = store.deviceProfile.layers[store.layer]
-        return PadFace(
-            layer: layer,
-            original: original,
-            selected: store.selected,
-            flashing: store.liveHit,
-            onSelect: { store.selected = $0 }
-        )
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        return VStack(spacing: 0) {
+            if store.link == .bluetooth {
+                historyBanner
+            }
+            PadFace(
+                layer: layer,
+                original: original,
+                selected: store.selected,
+                flashing: store.liveHit,
+                onSelect: { store.selected = $0 }
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
         .background(Theme.bg)
+    }
+
+    private var historyBanner: some View {
+        HStack(spacing: 8) {
+            Text("HISTORY")
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .foregroundStyle(Color.white)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(Theme.warn))
+            Text(store.showingHistory
+                 ? "\(store.historyCaption) — not live firmware"
+                 : "No saved map. Plug USB once to load bindings.")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(Theme.text)
+                .lineLimit(2)
+            Spacer(minLength: 8)
+            Text("Inspect only")
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .foregroundStyle(Theme.muted)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Theme.warn.opacity(0.12))
     }
 }
 
@@ -171,7 +210,15 @@ struct EditorView: View {
                         Text(store.selected.title)
                             .font(.system(size: 20, weight: .semibold, design: .rounded))
                             .foregroundStyle(Theme.text)
-                        Text(store.mode == .write ? "Editing layer \(store.layer + 1)" : "Layer \(store.layer + 1) · \(kit.title)")
+                        Text({
+                            if store.mode == .write { return "Editing layer \(store.layer + 1)" }
+                            if store.link == .bluetooth {
+                                return store.showingHistory
+                                    ? "Layer \(store.layer + 1) · \(kit.title) · history"
+                                    : "Layer \(store.layer + 1) · no saved map"
+                            }
+                            return "Layer \(store.layer + 1) · \(kit.title)"
+                        }())
                             .font(.system(size: 12, weight: .medium, design: .monospaced))
                             .foregroundStyle(Theme.muted)
                     }
@@ -208,7 +255,9 @@ struct EditorView: View {
                     }
                 } else {
                     LayerCheatSheet(layer: store.profile.layers[store.layer])
-                    Text("Read mode — pad presses only inspect. Switch to Write to rebind.")
+                    Text(store.link == .bluetooth
+                         ? "Bluetooth is inspect-only. Map is last USB read (history). Plug USB to capture or write."
+                         : "Read mode — pad presses only inspect. Switch to Write to rebind.")
                         .font(.system(size: 12))
                         .foregroundStyle(Theme.muted)
                 }
